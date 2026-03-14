@@ -20,13 +20,11 @@ image = (
 vol = modal.Volume.from_name("hf-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("dflash-results", create_if_missing=True)
 
-# DATASETS = ["gsm8k", "math500", "humaneval", "mbpp", "mt-bench", "alpaca"]
-# BLOCK_SIZES = [4, 8, 16]
-DATASETS = ["humaneval"]
-BLOCK_SIZES = [4]
+DATASETS = ["gsm8k", "math500", "humaneval", "mbpp", "mt-bench", "alpaca"]
+BLOCK_SIZES = [4, 8, 16]
 MODEL_PAIRS = [
-    # ("Qwen/Qwen3.5-4B", "z-lab/Qwen3.5-4B-DFlash"),
-    # ("Qwen/Qwen3.5-9B", "z-lab/Qwen3.5-9B-DFlash"),
+    ("Qwen/Qwen3.5-4B", "z-lab/Qwen3.5-4B-DFlash"),
+    ("Qwen/Qwen3.5-9B", "z-lab/Qwen3.5-9B-DFlash"),
     ("Qwen/Qwen3.5-35B-A3B", "z-lab/Qwen3.5-35B-A3B-DFlash"),
 ]
 

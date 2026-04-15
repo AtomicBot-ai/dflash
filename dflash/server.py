@@ -151,12 +151,11 @@ def _do_generate(
                     ):
                         if _cancel_event.is_set():
                             break
-                        new_text = resp.text
-                        if new_text and new_text != text_so_far:
-                            delta = new_text[len(text_so_far) :]
-                            text_so_far = new_text
+                        delta_text = resp.text
+                        if delta_text:
+                            text_so_far += delta_text
                             gen_tokens.extend(resp.tokens)
-                            _put({"type": "chunk", "content": delta})
+                            _put({"type": "chunk", "content": delta_text})
 
                         if resp.finish_reason is not None:
                             elapsed = time.perf_counter() - tic
@@ -422,10 +421,10 @@ def _load_models(args: argparse.Namespace) -> None:
     log.info("Target model loaded successfully")
 
     if args.draft_model:
-        from dflash.model_mlx import DFlashDraftModel
+        from dflash.model_mlx import load_draft
 
         log.info("Loading DFlash draft model: %s", args.draft_model)
-        _draft = DFlashDraftModel.from_pretrained(args.draft_model)
+        _draft = load_draft(args.draft_model)
         log.info("DFlash draft model loaded (block_size=%d)", _draft.config.block_size)
 
     _model_id = args.model_id or model_path.stem

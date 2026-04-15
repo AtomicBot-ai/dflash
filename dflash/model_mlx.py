@@ -130,7 +130,11 @@ def load(model_id: str):
 
 
 def load_draft(draft_id: str) -> DFlashDraftModel:
-    path = Path(snapshot_download(draft_id, allow_patterns=["*.safetensors", "*.json"]))
+    local = Path(draft_id)
+    if local.is_dir() and (local / "config.json").exists():
+        path = local
+    else:
+        path = Path(snapshot_download(draft_id, allow_patterns=["*.safetensors", "*.json"]))
     cfg = json.loads((path / "config.json").read_text())
     config = DFlashConfig(
         hidden_size=cfg["hidden_size"],

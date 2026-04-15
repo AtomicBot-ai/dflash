@@ -132,6 +132,13 @@ def _do_generate(
                 text_so_far = ""
                 tic = time.perf_counter()
 
+                # Qwen3-style templates add <think> to the generation prompt,
+                # so the model output starts with reasoning directly.
+                # Echo the tag so the frontend middleware can detect it.
+                _stripped = prompt_text.rstrip("\n")
+                if _stripped.endswith("<think>") and not _stripped.endswith("</think>"):
+                    _put({"type": "chunk", "content": "<think>\n"})
+
                 if _draft is not None:
                     from dflash.model_mlx import stream_generate as dflash_stream
                     from mlx_lm.sample_utils import make_sampler

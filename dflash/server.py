@@ -382,10 +382,16 @@ async def _cancel(_request: Request) -> JSONResponse:
 def _load_models(args: argparse.Namespace) -> None:
     global _model, _draft, _tokenizer, _model_id, _api_key, _ctx_size, _block_size
 
+    from pathlib import Path
+
     from mlx_lm import load as mlx_load
 
-    log.info("Loading target model: %s", args.model)
-    _model, _tokenizer = mlx_load(args.model)
+    model_path = Path(args.model)
+    if model_path.is_file():
+        model_path = model_path.parent
+
+    log.info("Loading target model: %s", model_path)
+    _model, _tokenizer = mlx_load(str(model_path))
     log.info("Target model loaded successfully")
 
     if args.draft_model:
@@ -395,9 +401,7 @@ def _load_models(args: argparse.Namespace) -> None:
         _draft = DFlashDraftModel.from_pretrained(args.draft_model)
         log.info("DFlash draft model loaded (block_size=%d)", _draft.config.block_size)
 
-    from pathlib import Path
-
-    _model_id = args.model_id or Path(args.model).stem
+    _model_id = args.model_id or model_path.stem
     _api_key = args.api_key or ""
     _ctx_size = args.ctx_size
     _block_size = args.block_size

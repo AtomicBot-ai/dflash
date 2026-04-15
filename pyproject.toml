@@ -43,3 +43,9 @@ server = [
     "uvicorn[standard]",
     "httpx",
 ]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "anyio",
+    "httpx",
+]

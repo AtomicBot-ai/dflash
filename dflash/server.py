@@ -102,6 +102,9 @@ def _check_auth(request: Request) -> Optional[JSONResponse]:
     return None
 
 
+_SENTINEL = object()
+
+
 def _do_generate(
     prompt_text: str,
     max_tokens: int,
@@ -109,49 +112,109 @@ def _do_generate(
     repetition_penalty: float,
     stop: list[str],
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Wraps sync mlx generation into an async generator of SSE-style dicts."""
+    """Run sync MLX generation in a thread, bridged to an async generator via Queue."""
 
     async def _inner() -> AsyncGenerator[dict[str, Any], None]:
         _cancel_event.clear()
-        prompt_tokens = _tokenizer.encode(prompt_text)  # type: ignore[union-attr]
-        prompt_size = len(prompt_tokens)
-        prompt_array = mx.array(prompt_tokens)
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
 
-        gen_tokens: list[int] = []
-        text_so_far = ""
-        tic = time.perf_counter()
+        def _put(item: dict[str, Any] | object) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
 
-        if _draft is not None:
-            from dflash.model_mlx import stream_generate as dflash_stream
-            from mlx_lm.sample_utils import make_sampler
+        def _sync_worker() -> None:
+            try:
+                prompt_tokens = _tokenizer.encode(prompt_text)  # type: ignore[union-attr]
+                prompt_size = len(prompt_tokens)
+                prompt_array = mx.array(prompt_tokens)
 
-            sampler = make_sampler(temp=temperature)
-            bs = _block_size if _block_size > 0 else None
+                gen_tokens: list[int] = []
+                text_so_far = ""
+                tic = time.perf_counter()
 
-            for resp in dflash_stream(
-                _model,
-                _draft,
-                _tokenizer,
-                prompt_array,
-                block_size=bs,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                sampler=sampler,
-            ):
-                if _cancel_event.is_set():
-                    break
-                new_text = resp.text
-                if new_text and new_text != text_so_far:
-                    delta = new_text[len(text_so_far) :]
-                    text_so_far = new_text
-                    gen_tokens.extend(resp.tokens)
-                    yield {"type": "chunk", "content": delta}
+                if _draft is not None:
+                    from dflash.model_mlx import stream_generate as dflash_stream
+                    from mlx_lm.sample_utils import make_sampler
 
-                if resp.finish_reason is not None:
+                    sampler = make_sampler(temp=temperature)
+                    bs = _block_size if _block_size > 0 else None
+
+                    for resp in dflash_stream(
+                        _model,
+                        _draft,
+                        _tokenizer,
+                        prompt_array,
+                        block_size=bs,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        sampler=sampler,
+                    ):
+                        if _cancel_event.is_set():
+                            break
+                        new_text = resp.text
+                        if new_text and new_text != text_so_far:
+                            delta = new_text[len(text_so_far) :]
+                            text_so_far = new_text
+                            gen_tokens.extend(resp.tokens)
+                            _put({"type": "chunk", "content": delta})
+
+                        if resp.finish_reason is not None:
+                            elapsed = time.perf_counter() - tic
+                            _put({
+                                "type": "done",
+                                "finish_reason": resp.finish_reason,
+                                "usage": {
+                                    "prompt_tokens": prompt_size,
+                                    "completion_tokens": len(gen_tokens),
+                                    "total_tokens": prompt_size + len(gen_tokens),
+                                },
+                                "timings": {
+                                    "prompt_n": prompt_size,
+                                    "predicted_n": len(gen_tokens),
+                                    "predicted_per_second": (
+                                        len(gen_tokens) / elapsed if elapsed > 0 else 0
+                                    ),
+                                    "prompt_per_second": resp.prompt_tps,
+                                },
+                            })
+                            return
+                else:
+                    from mlx_lm import stream_generate as mlx_stream
+                    from mlx_lm.sample_utils import make_sampler
+
+                    sampler = make_sampler(
+                        temp=temperature,
+                        top_p=1.0,
+                        min_tokens_to_keep=1,
+                    )
+
+                    for resp in mlx_stream(
+                        _model,
+                        _tokenizer,
+                        prompt=prompt_text,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                    ):
+                        if _cancel_event.is_set():
+                            break
+                        token_text = resp.text
+                        if token_text:
+                            gen_tokens.append(0)
+                            text_so_far += token_text
+                            _put({"type": "chunk", "content": token_text})
+
+                            should_stop = False
+                            for s in stop:
+                                if s and s in text_so_far:
+                                    should_stop = True
+                                    break
+                            if should_stop:
+                                break
+
                     elapsed = time.perf_counter() - tic
-                    yield {
+                    _put({
                         "type": "done",
-                        "finish_reason": resp.finish_reason,
+                        "finish_reason": "stop",
                         "usage": {
                             "prompt_tokens": prompt_size,
                             "completion_tokens": len(gen_tokens),
@@ -163,63 +226,27 @@ def _do_generate(
                             "predicted_per_second": (
                                 len(gen_tokens) / elapsed if elapsed > 0 else 0
                             ),
-                            "prompt_per_second": resp.prompt_tps,
+                            "prompt_per_second": (
+                                prompt_size / elapsed if elapsed > 0 else 0
+                            ),
                         },
-                    }
-                    return
-        else:
-            from mlx_lm import stream_generate as mlx_stream
-            from mlx_lm.sample_utils import make_sampler
+                    })
+            except Exception as exc:
+                log.exception("Generation error")
+                _put({"type": "error", "message": str(exc)})
+            finally:
+                _put(_SENTINEL)
 
-            sampler = make_sampler(
-                temp=temperature,
-                top_p=1.0,
-                min_tokens_to_keep=1,
-            )
+        loop.run_in_executor(None, _sync_worker)
 
-            for resp in mlx_stream(
-                _model,
-                _tokenizer,
-                prompt=prompt_text,
-                max_tokens=max_tokens,
-                sampler=sampler,
-            ):
-                if _cancel_event.is_set():
-                    break
-                token_text = resp.text
-                if token_text:
-                    gen_tokens.append(0)
-                    text_so_far += token_text
-                    yield {"type": "chunk", "content": token_text}
-
-                    should_stop = False
-                    for s in stop:
-                        if s and s in text_so_far:
-                            should_stop = True
-                            break
-                    if should_stop:
-                        break
-
-            elapsed = time.perf_counter() - tic
-            yield {
-                "type": "done",
-                "finish_reason": "stop",
-                "usage": {
-                    "prompt_tokens": prompt_size,
-                    "completion_tokens": len(gen_tokens),
-                    "total_tokens": prompt_size + len(gen_tokens),
-                },
-                "timings": {
-                    "prompt_n": prompt_size,
-                    "predicted_n": len(gen_tokens),
-                    "predicted_per_second": (
-                        len(gen_tokens) / elapsed if elapsed > 0 else 0
-                    ),
-                    "prompt_per_second": (
-                        prompt_size / elapsed if elapsed > 0 else 0
-                    ),
-                },
-            }
+        while True:
+            event = await queue.get()
+            if event is _SENTINEL:
+                break
+            if isinstance(event, dict) and event.get("type") == "error":
+                log.error("Generation failed: %s", event["message"])
+                break
+            yield event  # type: ignore[misc]
 
     return _inner()
 

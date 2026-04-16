@@ -272,7 +272,7 @@ async def _chat_completions(request: Request) -> JSONResponse | StreamingRespons
 
     messages = body.get("messages", [])
     temperature = float(body.get("temperature", 0.7))
-    max_tokens = body.get("max_tokens") or body.get("n_predict") or 2048
+    max_tokens = body.get("max_tokens") or body.get("max_output_tokens") or body.get("n_predict") or 16384
     max_tokens = int(max_tokens)
     repetition_penalty = float(body.get("repetition_penalty", 1.0))
     stop_sequences: list[str] = body.get("stop", []) or []

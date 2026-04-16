@@ -45,6 +45,52 @@ def _ts() -> int:
     return int(time.time())
 
 
+def _normalize_messages_for_template(messages: list[dict]) -> list[dict]:
+    """Coerce OpenAI-shape messages into what chat templates expect.
+
+    Two common mismatches are handled:
+
+    1. `assistant.tool_calls[*].function.arguments` arrives as a JSON string
+       (per OpenAI spec), but many chat templates (e.g. Qwen3.5) iterate
+       over it via `.items()` and require a dict.
+    2. `tool` role messages may arrive with stringified JSON content; some
+       templates need it as-is (string), which is already the case — left
+       untouched.
+
+    The normalization is non-destructive: messages are shallow-copied.
+    """
+    normalized: list[dict] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            normalized.append(msg)
+            continue
+        role = msg.get("role")
+        if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+            new_msg = dict(msg)
+            new_calls: list[dict] = []
+            for call in msg["tool_calls"]:
+                if not isinstance(call, dict):
+                    new_calls.append(call)
+                    continue
+                new_call = dict(call)
+                fn = new_call.get("function")
+                if isinstance(fn, dict):
+                    new_fn = dict(fn)
+                    args = new_fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            new_fn["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            new_fn["arguments"] = {}
+                    new_call["function"] = new_fn
+                new_calls.append(new_call)
+            new_msg["tool_calls"] = new_calls
+            normalized.append(new_msg)
+        else:
+            normalized.append(msg)
+    return normalized
+
+
 def _extract_text(
     messages: list[dict],
     tools: Optional[list[dict]] = None,
@@ -60,6 +106,7 @@ def _extract_text(
     if _tokenizer is None:
         raise RuntimeError("tokenizer not loaded")
     tok = _tokenizer._tokenizer
+    messages = _normalize_messages_for_template(messages)
     if hasattr(tok, "apply_chat_template"):
         kwargs: dict[str, Any] = {
             "tokenize": False,
@@ -71,14 +118,29 @@ def _extract_text(
                 kwargs["tool_choice"] = tool_choice
         try:
             rendered = tok.apply_chat_template(messages, **kwargs)
-        except TypeError:
-            kwargs.pop("tools", None)
-            kwargs.pop("tool_choice", None)
-            log.warning(
-                "tokenizer.apply_chat_template does not accept tools kwarg; "
-                "falling back without tool schema"
-            )
-            rendered = tok.apply_chat_template(messages, **kwargs)
+        except TypeError as exc:
+            err_text = str(exc).lower()
+            # Only treat as "tools kwarg unsupported" if the error is about
+            # unexpected keyword arguments. Template-internal TypeErrors
+            # (e.g. iterating over a string with `.items()`) must propagate.
+            if "tools" in err_text and (
+                "unexpected keyword" in err_text
+                or "got an unexpected" in err_text
+                or "keyword argument" in err_text
+            ):
+                kwargs.pop("tools", None)
+                kwargs.pop("tool_choice", None)
+                log.warning(
+                    "tokenizer.apply_chat_template does not accept tools "
+                    "kwarg; falling back without tool schema"
+                )
+                rendered = tok.apply_chat_template(messages, **kwargs)
+            else:
+                log.error(
+                    "chat_template raised TypeError during rendering: %s",
+                    exc,
+                )
+                raise
         if tools:
             has_tool_section = (
                 "<tools>" in rendered

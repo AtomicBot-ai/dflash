@@ -70,7 +70,7 @@ def _extract_text(
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
         try:
-            return tok.apply_chat_template(messages, **kwargs)
+            rendered = tok.apply_chat_template(messages, **kwargs)
         except TypeError:
             kwargs.pop("tools", None)
             kwargs.pop("tool_choice", None)
@@ -78,7 +78,26 @@ def _extract_text(
                 "tokenizer.apply_chat_template does not accept tools kwarg; "
                 "falling back without tool schema"
             )
-            return tok.apply_chat_template(messages, **kwargs)
+            rendered = tok.apply_chat_template(messages, **kwargs)
+        if tools:
+            has_tool_section = (
+                "<tools>" in rendered
+                or "tool_call" in rendered
+                or "function" in rendered.lower()
+            )
+            log.info(
+                "prompt rendered: len=%d, tools_in_prompt=%s",
+                len(rendered),
+                has_tool_section,
+            )
+            if not has_tool_section:
+                log.warning(
+                    "tools were passed but NOT rendered into the prompt — "
+                    "chat_template likely ignores the `tools` variable. "
+                    "Prompt tail: ...%s",
+                    rendered[-400:],
+                )
+        return rendered
     parts: list[str] = []
     for m in messages:
         content = m.get("content", "")
@@ -108,6 +127,15 @@ _TOOL_CALL_LLAMA_RE = re.compile(
     r"<\|python_tag\|>\s*(\{.*?\})(?:\s*<\|eom_id\|>|\s*$)", re.DOTALL
 )
 _TOOL_CALL_MISTRAL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*\])", re.DOTALL)
+
+_TOOL_CALL_QWEN_XML_RE = re.compile(
+    r"<tool_call>\s*<function=([^>\s]+)>(.*?)</function>\s*</tool_call>",
+    re.DOTALL,
+)
+_TOOL_CALL_QWEN_XML_PARAM_RE = re.compile(
+    r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
+    re.DOTALL,
+)
 
 
 def _to_tool_call(obj: dict) -> Optional[dict]:
@@ -147,6 +175,28 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
         return text, []
 
     calls: list[dict] = []
+
+    matches = list(_TOOL_CALL_QWEN_XML_RE.finditer(text))
+    if matches:
+        for m in matches:
+            fn_name = m.group(1).strip()
+            inner = m.group(2)
+            args_dict: dict[str, Any] = {}
+            for pm in _TOOL_CALL_QWEN_XML_PARAM_RE.finditer(inner):
+                key = pm.group(1).strip()
+                raw_val = pm.group(2).strip()
+                parsed: Any = raw_val
+                try:
+                    parsed = json.loads(raw_val)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                args_dict[key] = parsed
+            call = _to_tool_call({"name": fn_name, "arguments": args_dict})
+            if call:
+                calls.append(call)
+        if calls:
+            cleaned = _TOOL_CALL_QWEN_XML_RE.sub("", text).strip()
+            return cleaned, calls
 
     matches = list(_TOOL_CALL_QWEN_RE.finditer(text))
     if matches:
@@ -499,11 +549,22 @@ async def _handle_non_streaming(
     tool_calls: list[dict] = []
     content: Optional[str] = full_text
     finish_reason = "stop"
-    if tools_enabled and _has_tool_call_marker(full_text):
-        cleaned, tool_calls = _parse_tool_calls(full_text)
-        if tool_calls:
-            content = cleaned or None
-            finish_reason = "tool_calls"
+    if tools_enabled:
+        log.info(
+            "raw model output (tools_enabled=True, len=%d): %r",
+            len(full_text),
+            full_text[:1200] + ("...[truncated]" if len(full_text) > 1200 else ""),
+        )
+        if _has_tool_call_marker(full_text):
+            cleaned, tool_calls = _parse_tool_calls(full_text)
+            if tool_calls:
+                content = cleaned or None
+                finish_reason = "tool_calls"
+        else:
+            log.warning(
+                "tools_enabled but model produced no <tool_call>/<|python_tag|>/"
+                "[TOOL_CALLS] markers — model did not follow tool-calling format"
+            )
 
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
@@ -619,8 +680,20 @@ async def _handle_streaming(
                 finish_reason = event.get("finish_reason", "stop")
                 tool_calls: list[dict] = []
 
-                if tools_enabled and _has_tool_call_marker(full_text):
-                    _cleaned, tool_calls = _parse_tool_calls(full_text)
+                if tools_enabled:
+                    log.info(
+                        "raw model output (stream, tools_enabled=True, len=%d): %r",
+                        len(full_text),
+                        full_text[:1200]
+                        + ("...[truncated]" if len(full_text) > 1200 else ""),
+                    )
+                    if _has_tool_call_marker(full_text):
+                        _cleaned, tool_calls = _parse_tool_calls(full_text)
+                    else:
+                        log.warning(
+                            "tools_enabled but stream produced no tool-call "
+                            "markers — model did not follow tool-calling format"
+                        )
 
                 if tool_calls:
                     for idx, call in enumerate(tool_calls):

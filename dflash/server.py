@@ -4,12 +4,14 @@ DFlash MLX Inference Server — OpenAI-compatible HTTP API.
 Supports both standard mlx-lm inference and DFlash-accelerated
 speculative decoding when a --draft-model is provided.
 """
+
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any, AsyncGenerator, Optional
@@ -43,15 +45,40 @@ def _ts() -> int:
     return int(time.time())
 
 
-def _extract_text(messages: list[dict]) -> str:
-    """Apply the tokenizer chat template to produce a prompt string."""
+def _extract_text(
+    messages: list[dict],
+    tools: Optional[list[dict]] = None,
+    tool_choice: Any = None,
+) -> str:
+    """Apply the tokenizer chat template to produce a prompt string.
+
+    When `tools` are provided, they are forwarded to `apply_chat_template` so
+    the model sees tool schemas rendered per its template (Qwen, Hermes,
+    Llama 3.1, Mistral, etc.). Falls back gracefully for tokenizers that do
+    not accept the `tools` kwarg.
+    """
     if _tokenizer is None:
         raise RuntimeError("tokenizer not loaded")
     tok = _tokenizer._tokenizer
     if hasattr(tok, "apply_chat_template"):
-        return tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
+        try:
+            return tok.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("tools", None)
+            kwargs.pop("tool_choice", None)
+            log.warning(
+                "tokenizer.apply_chat_template does not accept tools kwarg; "
+                "falling back without tool schema"
+            )
+            return tok.apply_chat_template(messages, **kwargs)
     parts: list[str] = []
     for m in messages:
         content = m.get("content", "")
@@ -62,6 +89,125 @@ def _extract_text(messages: list[dict]) -> str:
         parts.append(f"{m['role']}: {content}")
     parts.append("assistant:")
     return "\n".join(parts)
+
+
+_TOOL_CALL_START_MARKERS: tuple[str, ...] = (
+    "<tool_call>",
+    "<|tool_call|>",
+    "<|python_tag|>",
+    "[TOOL_CALLS]",
+)
+
+_TOOL_CALL_MAX_MARKER_LEN = max(len(m) for m in _TOOL_CALL_START_MARKERS)
+
+_TOOL_CALL_QWEN_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TOOL_CALL_HERMES_PIPE_RE = re.compile(
+    r"<\|tool_call\|>\s*(\{.*?\})(?=\s*(?:<\||$))", re.DOTALL
+)
+_TOOL_CALL_LLAMA_RE = re.compile(
+    r"<\|python_tag\|>\s*(\{.*?\})(?:\s*<\|eom_id\|>|\s*$)", re.DOTALL
+)
+_TOOL_CALL_MISTRAL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*\])", re.DOTALL)
+
+
+def _to_tool_call(obj: dict) -> Optional[dict]:
+    """Coerce a model-produced dict into OpenAI tool_call shape."""
+    if not isinstance(obj, dict):
+        return None
+    fn = obj.get("function") if isinstance(obj.get("function"), dict) else None
+    name = obj.get("name") or (fn.get("name") if fn else None)
+    if not name:
+        return None
+    args: Any = obj.get("arguments")
+    if args is None:
+        args = obj.get("parameters")
+    if args is None and fn is not None:
+        args = fn.get("arguments")
+    if args is None:
+        args = {}
+    if not isinstance(args, str):
+        try:
+            args = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            args = "{}"
+    return {
+        "id": f"call_{uuid.uuid4().hex[:12]}",
+        "type": "function",
+        "function": {"name": str(name), "arguments": args},
+    }
+
+
+def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
+    """Detect tool-call spans produced by common templates and extract them.
+
+    Returns `(cleaned_content, tool_calls)`. If no tool calls are found, the
+    original text is returned unchanged and `tool_calls` is empty.
+    """
+    if not text:
+        return text, []
+
+    calls: list[dict] = []
+
+    matches = list(_TOOL_CALL_QWEN_RE.finditer(text))
+    if matches:
+        for m in matches:
+            try:
+                obj = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                continue
+            call = _to_tool_call(obj)
+            if call:
+                calls.append(call)
+        if calls:
+            cleaned = _TOOL_CALL_QWEN_RE.sub("", text).strip()
+            return cleaned, calls
+
+    matches = list(_TOOL_CALL_HERMES_PIPE_RE.finditer(text))
+    if matches:
+        for m in matches:
+            try:
+                obj = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                continue
+            call = _to_tool_call(obj)
+            if call:
+                calls.append(call)
+        if calls:
+            cleaned = _TOOL_CALL_HERMES_PIPE_RE.sub("", text).strip()
+            return cleaned, calls
+
+    m = _TOOL_CALL_LLAMA_RE.search(text)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            call = _to_tool_call(obj)
+            if call:
+                calls.append(call)
+                cleaned = text[: m.start()].strip()
+                return cleaned, calls
+        except json.JSONDecodeError:
+            pass
+
+    m = _TOOL_CALL_MISTRAL_RE.search(text)
+    if m:
+        try:
+            arr = json.loads(m.group(1))
+            if isinstance(arr, list):
+                for obj in arr:
+                    call = _to_tool_call(obj)
+                    if call:
+                        calls.append(call)
+                if calls:
+                    cleaned = text[: m.start()].strip()
+                    return cleaned, calls
+        except json.JSONDecodeError:
+            pass
+
+    return text, []
+
+
+def _has_tool_call_marker(text: str) -> bool:
+    return any(marker in text for marker in _TOOL_CALL_START_MARKERS)
 
 
 async def _health(_request: Request) -> JSONResponse:
@@ -166,23 +312,27 @@ def _do_generate(
 
                         if resp.finish_reason is not None:
                             elapsed = time.perf_counter() - tic
-                            _put({
-                                "type": "done",
-                                "finish_reason": resp.finish_reason,
-                                "usage": {
-                                    "prompt_tokens": prompt_size,
-                                    "completion_tokens": len(gen_tokens),
-                                    "total_tokens": prompt_size + len(gen_tokens),
-                                },
-                                "timings": {
-                                    "prompt_n": prompt_size,
-                                    "predicted_n": len(gen_tokens),
-                                    "predicted_per_second": (
-                                        len(gen_tokens) / elapsed if elapsed > 0 else 0
-                                    ),
-                                    "prompt_per_second": resp.prompt_tps,
-                                },
-                            })
+                            _put(
+                                {
+                                    "type": "done",
+                                    "finish_reason": resp.finish_reason,
+                                    "usage": {
+                                        "prompt_tokens": prompt_size,
+                                        "completion_tokens": len(gen_tokens),
+                                        "total_tokens": prompt_size + len(gen_tokens),
+                                    },
+                                    "timings": {
+                                        "prompt_n": prompt_size,
+                                        "predicted_n": len(gen_tokens),
+                                        "predicted_per_second": (
+                                            len(gen_tokens) / elapsed
+                                            if elapsed > 0
+                                            else 0
+                                        ),
+                                        "prompt_per_second": resp.prompt_tps,
+                                    },
+                                }
+                            )
                             return
                 else:
                     from mlx_lm import stream_generate as mlx_stream
@@ -218,25 +368,27 @@ def _do_generate(
                                 break
 
                     elapsed = time.perf_counter() - tic
-                    _put({
-                        "type": "done",
-                        "finish_reason": "stop",
-                        "usage": {
-                            "prompt_tokens": prompt_size,
-                            "completion_tokens": len(gen_tokens),
-                            "total_tokens": prompt_size + len(gen_tokens),
-                        },
-                        "timings": {
-                            "prompt_n": prompt_size,
-                            "predicted_n": len(gen_tokens),
-                            "predicted_per_second": (
-                                len(gen_tokens) / elapsed if elapsed > 0 else 0
-                            ),
-                            "prompt_per_second": (
-                                prompt_size / elapsed if elapsed > 0 else 0
-                            ),
-                        },
-                    })
+                    _put(
+                        {
+                            "type": "done",
+                            "finish_reason": "stop",
+                            "usage": {
+                                "prompt_tokens": prompt_size,
+                                "completion_tokens": len(gen_tokens),
+                                "total_tokens": prompt_size + len(gen_tokens),
+                            },
+                            "timings": {
+                                "prompt_n": prompt_size,
+                                "predicted_n": len(gen_tokens),
+                                "predicted_per_second": (
+                                    len(gen_tokens) / elapsed if elapsed > 0 else 0
+                                ),
+                                "prompt_per_second": (
+                                    prompt_size / elapsed if elapsed > 0 else 0
+                                ),
+                            },
+                        }
+                    )
             except Exception as exc:
                 log.exception("Generation error")
                 _put({"type": "error", "message": str(exc)})
@@ -266,37 +418,62 @@ async def _chat_completions(request: Request) -> JSONResponse | StreamingRespons
         body = await request.json()
     except Exception as exc:
         return JSONResponse(
-            {"error": {"message": str(exc), "type": "invalid_request_error", "code": None}},
+            {
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "code": None,
+                }
+            },
             status_code=400,
         )
 
     messages = body.get("messages", [])
     temperature = float(body.get("temperature", 0.7))
-    max_tokens = body.get("max_tokens") or body.get("max_output_tokens") or body.get("n_predict") or 16384
+    max_tokens = (
+        body.get("max_tokens")
+        or body.get("max_output_tokens")
+        or body.get("n_predict")
+        or 16384
+    )
     max_tokens = int(max_tokens)
     repetition_penalty = float(body.get("repetition_penalty", 1.0))
     stop_sequences: list[str] = body.get("stop", []) or []
     is_streaming = bool(body.get("stream", False))
     model_name = body.get("model", _model_id)
+    tools = body.get("tools") or None
+    tool_choice = body.get("tool_choice")
 
     log.info(
-        "Request: model=%s, messages=%d, stream=%s",
+        "Request: model=%s, messages=%d, stream=%s, tools=%d",
         model_name,
         len(messages),
         is_streaming,
+        len(tools) if isinstance(tools, list) else 0,
     )
 
-    prompt_text = _extract_text(messages)
+    prompt_text = _extract_text(messages, tools=tools, tool_choice=tool_choice)
+    tools_enabled = bool(tools)
 
     if is_streaming:
         return await _handle_streaming(
-            prompt_text, model_name, max_tokens, temperature,
-            repetition_penalty, stop_sequences,
+            prompt_text,
+            model_name,
+            max_tokens,
+            temperature,
+            repetition_penalty,
+            stop_sequences,
+            tools_enabled,
         )
     else:
         return await _handle_non_streaming(
-            prompt_text, model_name, max_tokens, temperature,
-            repetition_penalty, stop_sequences,
+            prompt_text,
+            model_name,
+            max_tokens,
+            temperature,
+            repetition_penalty,
+            stop_sequences,
+            tools_enabled,
         )
 
 
@@ -307,6 +484,7 @@ async def _handle_non_streaming(
     temperature: float,
     repetition_penalty: float,
     stop: list[str],
+    tools_enabled: bool = False,
 ) -> JSONResponse:
     full_text = ""
     usage_info: dict[str, Any] = {}
@@ -318,6 +496,19 @@ async def _handle_non_streaming(
         elif event["type"] == "done":
             usage_info = event.get("usage", {})
 
+    tool_calls: list[dict] = []
+    content: Optional[str] = full_text
+    finish_reason = "stop"
+    if tools_enabled and _has_tool_call_marker(full_text):
+        cleaned, tool_calls = _parse_tool_calls(full_text)
+        if tool_calls:
+            content = cleaned or None
+            finish_reason = "tool_calls"
+
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
     response_id = _generate_id()
     return JSONResponse(
         {
@@ -328,13 +519,31 @@ async def _handle_non_streaming(
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": full_text},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": usage_info,
         }
     )
+
+
+def _safe_emit_split(accumulated_unsent: str) -> tuple[str, str]:
+    """Split unsent text into (safe_to_emit, hold_back) such that `hold_back`
+    keeps any trailing partial prefix of a tool-call start marker intact.
+
+    Without this, we could leak the first characters of e.g. "<tool_call>" to
+    the client before realizing a tool call began, making downstream parsing
+    inconsistent.
+    """
+    if not accumulated_unsent:
+        return "", ""
+    hold = min(len(accumulated_unsent), _TOOL_CALL_MAX_MARKER_LEN)
+    for i in range(hold, 0, -1):
+        tail = accumulated_unsent[-i:]
+        if any(marker.startswith(tail) for marker in _TOOL_CALL_START_MARKERS):
+            return accumulated_unsent[:-i], tail
+    return accumulated_unsent, ""
 
 
 async def _handle_streaming(
@@ -344,6 +553,7 @@ async def _handle_streaming(
     temperature: float,
     repetition_penalty: float,
     stop: list[str],
+    tools_enabled: bool = False,
 ) -> StreamingResponse:
     response_id = _generate_id()
     created = _ts()
@@ -360,27 +570,88 @@ async def _handle_streaming(
         }
         yield f"data: {json.dumps(initial_chunk)}\n\n"
 
+        def _content_chunk(content: str) -> str:
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            return f"data: {json.dumps(chunk)}\n\n"
+
+        full_text = ""
+        unsent = ""
+        tool_call_detected = False
+
         gen = _do_generate(
             prompt_text, max_tokens, temperature, repetition_penalty, stop
         )
         async for event in gen:
             if event["type"] == "chunk":
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": event["content"]},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
+                piece = event["content"]
+                full_text += piece
+
+                if not tools_enabled:
+                    yield _content_chunk(piece)
+                    continue
+
+                if tool_call_detected:
+                    continue
+
+                unsent += piece
+                if _has_tool_call_marker(full_text):
+                    tool_call_detected = True
+                    unsent = ""
+                    continue
+
+                safe, unsent = _safe_emit_split(unsent)
+                if safe:
+                    yield _content_chunk(safe)
 
             elif event["type"] == "done":
+                finish_reason = event.get("finish_reason", "stop")
+                tool_calls: list[dict] = []
+
+                if tools_enabled and _has_tool_call_marker(full_text):
+                    _cleaned, tool_calls = _parse_tool_calls(full_text)
+
+                if tool_calls:
+                    for idx, call in enumerate(tool_calls):
+                        delta_call = {
+                            "index": idx,
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["function"]["name"],
+                                "arguments": call["function"]["arguments"],
+                            },
+                        }
+                        tc_chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"tool_calls": [delta_call]},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(tc_chunk)}\n\n"
+                    finish_reason = "tool_calls"
+                elif tools_enabled and unsent:
+                    yield _content_chunk(unsent)
+                    unsent = ""
+
                 final_chunk = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -390,7 +661,7 @@ async def _handle_streaming(
                         {
                             "index": 0,
                             "delta": {},
-                            "finish_reason": event.get("finish_reason", "stop"),
+                            "finish_reason": finish_reason,
                         }
                     ],
                     "usage": event.get("usage"),
@@ -456,11 +727,11 @@ def parse_args() -> argparse.Namespace:
         "--model", "-m", required=True, help="Path to the MLX model directory"
     )
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
-    parser.add_argument("--ctx-size", type=int, default=4096, help="Context window size")
-    parser.add_argument("--api-key", default="", help="API key for authentication")
     parser.add_argument(
-        "--model-id", default="", help="Model ID reported by the API"
+        "--ctx-size", type=int, default=4096, help="Context window size"
     )
+    parser.add_argument("--api-key", default="", help="API key for authentication")
+    parser.add_argument("--model-id", default="", help="Model ID reported by the API")
     parser.add_argument(
         "--draft-model",
         default="",

@@ -95,6 +95,7 @@ def _extract_text(
     messages: list[dict],
     tools: Optional[list[dict]] = None,
     tool_choice: Any = None,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
 ) -> str:
     """Apply the tokenizer chat template to produce a prompt string.
 
@@ -102,6 +103,11 @@ def _extract_text(
     the model sees tool schemas rendered per its template (Qwen, Hermes,
     Llama 3.1, Mistral, etc.). Falls back gracefully for tokenizers that do
     not accept the `tools` kwarg.
+
+    `chat_template_kwargs` forwards arbitrary per-render knobs to the chat
+    template (e.g. ``{"enable_thinking": False}`` for Qwen3 / GLM-4.5
+    reasoning control). Keys the template does not recognise are silently
+    stripped on TypeError and the render is retried without them.
     """
     if _tokenizer is None:
         raise RuntimeError("tokenizer not loaded")
@@ -116,25 +122,64 @@ def _extract_text(
             kwargs["tools"] = tools
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
-        try:
-            rendered = tok.apply_chat_template(messages, **kwargs)
-        except TypeError as exc:
-            err_text = str(exc).lower()
-            # Only treat as "tools kwarg unsupported" if the error is about
-            # unexpected keyword arguments. Template-internal TypeErrors
-            # (e.g. iterating over a string with `.items()`) must propagate.
-            if "tools" in err_text and (
+        template_kwarg_keys: list[str] = []
+        if chat_template_kwargs:
+            for k, v in chat_template_kwargs.items():
+                kwargs[k] = v
+                template_kwarg_keys.append(k)
+
+        def _render(current_kwargs: dict[str, Any]) -> str:
+            return tok.apply_chat_template(messages, **current_kwargs)
+
+        def _is_unexpected_kwarg_error(err_text: str) -> bool:
+            return (
                 "unexpected keyword" in err_text
                 or "got an unexpected" in err_text
                 or "keyword argument" in err_text
-            ):
+            )
+
+        try:
+            rendered = _render(kwargs)
+        except TypeError as exc:
+            err_text = str(exc).lower()
+            is_kwarg_err = _is_unexpected_kwarg_error(err_text)
+            if is_kwarg_err and "tools" in err_text:
                 kwargs.pop("tools", None)
                 kwargs.pop("tool_choice", None)
                 log.warning(
                     "tokenizer.apply_chat_template does not accept tools "
                     "kwarg; falling back without tool schema"
                 )
-                rendered = tok.apply_chat_template(messages, **kwargs)
+                try:
+                    rendered = _render(kwargs)
+                except TypeError as exc2:
+                    # Secondary failure likely from chat_template_kwargs the
+                    # template does not understand — drop them and retry.
+                    if template_kwarg_keys and _is_unexpected_kwarg_error(
+                        str(exc2).lower()
+                    ):
+                        for k in template_kwarg_keys:
+                            kwargs.pop(k, None)
+                        log.warning(
+                            "tokenizer.apply_chat_template rejected "
+                            "chat_template_kwargs %s; retrying without them",
+                            template_kwarg_keys,
+                        )
+                        rendered = _render(kwargs)
+                    else:
+                        raise
+            elif is_kwarg_err and template_kwarg_keys:
+                # Template is unaware of a chat_template_kwargs entry
+                # (e.g. ``enable_thinking`` on a non-reasoning model). Drop
+                # them all and retry — request should still succeed.
+                for k in template_kwarg_keys:
+                    kwargs.pop(k, None)
+                log.warning(
+                    "tokenizer.apply_chat_template rejected "
+                    "chat_template_kwargs %s; retrying without them",
+                    template_kwarg_keys,
+                )
+                rendered = _render(kwargs)
             else:
                 log.error(
                     "chat_template raised TypeError during rendering: %s",
@@ -555,16 +600,28 @@ async def _chat_completions(request: Request) -> JSONResponse | StreamingRespons
     model_name = body.get("model", _model_id)
     tools = body.get("tools") or None
     tool_choice = body.get("tool_choice")
+    # Per-render chat template knobs (e.g. ``enable_thinking`` for Qwen3 /
+    # GLM-4.5 reasoning control). Ignore if the caller sends a non-dict.
+    raw_template_kwargs = body.get("chat_template_kwargs")
+    chat_template_kwargs: Optional[dict[str, Any]] = (
+        raw_template_kwargs if isinstance(raw_template_kwargs, dict) else None
+    )
 
     log.info(
-        "Request: model=%s, messages=%d, stream=%s, tools=%d",
+        "Request: model=%s, messages=%d, stream=%s, tools=%d, template_kwargs=%s",
         model_name,
         len(messages),
         is_streaming,
         len(tools) if isinstance(tools, list) else 0,
+        list(chat_template_kwargs.keys()) if chat_template_kwargs else [],
     )
 
-    prompt_text = _extract_text(messages, tools=tools, tool_choice=tool_choice)
+    prompt_text = _extract_text(
+        messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        chat_template_kwargs=chat_template_kwargs,
+    )
     tools_enabled = bool(tools)
 
     if is_streaming:

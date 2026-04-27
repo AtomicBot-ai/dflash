@@ -510,9 +510,9 @@ def _do_generate(
                     ):
                         if _cancel_event.is_set():
                             break
+                        gen_tokens.append(resp.token)
                         token_text = resp.text
                         if token_text:
-                            gen_tokens.append(0)
                             text_so_far += token_text
                             _put({"type": "chunk", "content": token_text})
 

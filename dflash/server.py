@@ -19,6 +19,7 @@ from typing import Any, AsyncGenerator, Optional
 
 import mlx.core as mx
 import uvicorn
+from mlx_lm import generate as _mlx_generate
 from mlx_lm.models import gemma4_text as _gemma4_text
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from starlette.applications import Starlette
@@ -53,6 +54,17 @@ def _patched_gemma4_sanitize(self, weights):
 
 
 _gemma4_text.Model.sanitize = _patched_gemma4_sanitize
+
+
+# mlx_lm.generate.generation_stream is created via mx.new_thread_local_stream()
+# at module import time and is bound to the importing thread (here: the main
+# thread, where mlx_lm gets pulled in by the imports above). Inference runs in
+# a separate worker thread (_inference_executor below), which does not see that
+# stream and raises "There is no Stream(gpu, 1) in current thread" on the first
+# mx.eval inside stream_generate. Replace with the default stream, which is
+# valid in any thread. The thread-local stream existed for parallelism that
+# this single-worker server does not exploit.
+_mlx_generate.generation_stream = mx.default_stream(mx.default_device())
 
 _model = None
 _draft = None

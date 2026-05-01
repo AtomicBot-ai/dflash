@@ -13,19 +13,27 @@ import concurrent.futures
 import json
 import logging
 import re
+import sys
 import time
 import uuid
 from typing import Any, AsyncGenerator, Optional
 
 import mlx.core as mx
+import mlx_lm.generate  # noqa: F401 — registers the submodule in sys.modules
 import uvicorn
-from mlx_lm import generate as _mlx_generate
 from mlx_lm.models import gemma4_text as _gemma4_text
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
+
+# `mlx_lm/__init__.py` does `from .generate import generate`, which overrides
+# the `generate` attribute on the `mlx_lm` package with the FUNCTION of the
+# same name. As a consequence both `from mlx_lm import generate` and
+# `import mlx_lm.generate as g` bind the function, not the submodule. Pull the
+# real submodule out of sys.modules so we can mutate its globals below.
+_mlx_generate = sys.modules["mlx_lm.generate"]
 
 logging.basicConfig(level=logging.INFO, format="[mlx] %(message)s")
 log = logging.getLogger("dflash.server")
@@ -56,15 +64,22 @@ def _patched_gemma4_sanitize(self, weights):
 _gemma4_text.Model.sanitize = _patched_gemma4_sanitize
 
 
-# mlx_lm.generate.generation_stream is created via mx.new_thread_local_stream()
-# at module import time and is bound to the importing thread (here: the main
-# thread, where mlx_lm gets pulled in by the imports above). Inference runs in
-# a separate worker thread (_inference_executor below), which does not see that
-# stream and raises "There is no Stream(gpu, 1) in current thread" on the first
-# mx.eval inside stream_generate. Replace with the default stream, which is
-# valid in any thread. The thread-local stream existed for parallelism that
-# this single-worker server does not exploit.
-_mlx_generate.generation_stream = mx.default_stream(mx.default_device())
+# All MLX work — model load, generation_stream binding, and inference — must
+# happen in the same thread, because mlx 0.31.x streams are thread-local:
+#   * mlx_lm.generate.generation_stream is built via mx.new_thread_local_stream()
+#     at module import time, bound to the importing thread.
+#   * mlx_lm.load() materializes model tensors on the current thread's default
+#     stream; touching them from any other thread raises
+#     "There is no Stream(gpu, N) in current thread" on mx.eval.
+# Schedule both bootstrap and per-request work on _inference_executor so they
+# share a single worker thread; see main() and _chat_completions().
+def _bootstrap_inference_thread(args: argparse.Namespace) -> None:
+    def _init() -> None:
+        _mlx_generate.generation_stream = mx.default_stream(mx.default_device())
+        _load_models(args)
+
+    _inference_executor.submit(_init).result()
+
 
 _model = None
 _draft = None
@@ -990,7 +1005,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    _load_models(args)
+    _bootstrap_inference_thread(args)
 
     app = create_app()
 

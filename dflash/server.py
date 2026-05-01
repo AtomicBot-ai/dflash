@@ -151,6 +151,15 @@ def _normalize_messages_for_template(messages: list[dict]) -> list[dict]:
                 new_calls.append(new_call)
             new_msg["tool_calls"] = new_calls
             normalized.append(new_msg)
+        elif role == "tool" and isinstance(msg.get("content"), str):
+            new_msg = dict(msg)
+            try:
+                parsed = json.loads(new_msg["content"])
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                new_msg["content"] = parsed
+            normalized.append(new_msg)
         else:
             normalized.append(msg)
     return normalized
@@ -256,6 +265,7 @@ def _extract_text(
                 "<tools>" in rendered
                 or "tool_call" in rendered
                 or "function" in rendered.lower()
+                or "<|tool>" in rendered
             )
             log.info(
                 "prompt rendered: len=%d, tools_in_prompt=%s",
@@ -285,6 +295,7 @@ def _extract_text(
 _TOOL_CALL_START_MARKERS: tuple[str, ...] = (
     "<tool_call>",
     "<|tool_call|>",
+    "<|tool_call>",  # Gemma 4: asymmetric open marker, paired with `<tool_call|>`
     "<|python_tag|>",
     "[TOOL_CALLS]",
 )
@@ -308,6 +319,120 @@ _TOOL_CALL_QWEN_XML_PARAM_RE = re.compile(
     r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
     re.DOTALL,
 )
+
+# Gemma 4 emits `<|tool_call>call:NAME{key:value,...}<tool_call|>` where the
+# inner body is a pseudo-DSL (NOT JSON): bare identifier keys, strings escaped
+# as `<|"|>...<|"|>`, plus numbers, bools, arrays and nested objects. See
+# chat_template.jinja `format_argument` / `format_function_declaration` macros
+# in the model checkpoint.
+_TOOL_CALL_GEMMA4_RE = re.compile(
+    r"<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>",
+    re.DOTALL,
+)
+_GEMMA4_QUOTE = '<|"|>'
+
+
+class _Gemma4Parser:
+    """Recursive-descent parser for Gemma 4's pseudo-JSON args DSL."""
+
+    def __init__(self, src: str) -> None:
+        self.src = src
+        self.pos = 0
+
+    def _eof(self) -> bool:
+        return self.pos >= len(self.src)
+
+    def _peek(self) -> str:
+        return "" if self._eof() else self.src[self.pos]
+
+    def _skip_ws(self) -> None:
+        while not self._eof() and self.src[self.pos] in " \t\r\n":
+            self.pos += 1
+
+    def _consume(self, s: str) -> bool:
+        if self.src.startswith(s, self.pos):
+            self.pos += len(s)
+            return True
+        return False
+
+    def parse_object_inner(self) -> dict[str, Any]:
+        """Parse `key:value,key:value,...` until EOF or `}`."""
+        result: dict[str, Any] = {}
+        self._skip_ws()
+        while not self._eof() and self._peek() != "}":
+            key = self._read_key()
+            self._skip_ws()
+            if not self._consume(":"):
+                raise ValueError(f"expected ':' at {self.pos}")
+            self._skip_ws()
+            result[key] = self._read_value()
+            self._skip_ws()
+            if not self._consume(","):
+                break
+            self._skip_ws()
+        return result
+
+    def _read_key(self) -> str:
+        if self._consume(_GEMMA4_QUOTE):
+            end = self.src.find(_GEMMA4_QUOTE, self.pos)
+            if end < 0:
+                raise ValueError(f"unterminated quoted key at {self.pos}")
+            key = self.src[self.pos : end]
+            self.pos = end + len(_GEMMA4_QUOTE)
+            return key
+        start = self.pos
+        while not self._eof() and self.src[self.pos] not in ":,{}[] \t\r\n":
+            self.pos += 1
+        return self.src[start : self.pos]
+
+    def _read_value(self) -> Any:
+        if self._consume(_GEMMA4_QUOTE):
+            end = self.src.find(_GEMMA4_QUOTE, self.pos)
+            if end < 0:
+                raise ValueError(f"unterminated string at {self.pos}")
+            v = self.src[self.pos : end]
+            self.pos = end + len(_GEMMA4_QUOTE)
+            return v
+        if self._consume("["):
+            items: list[Any] = []
+            self._skip_ws()
+            while not self._eof() and self._peek() != "]":
+                items.append(self._read_value())
+                self._skip_ws()
+                if not self._consume(","):
+                    break
+                self._skip_ws()
+            if not self._consume("]"):
+                raise ValueError(f"unterminated array at {self.pos}")
+            return items
+        if self._consume("{"):
+            obj = self.parse_object_inner()
+            if not self._consume("}"):
+                raise ValueError(f"unterminated object at {self.pos}")
+            return obj
+        start = self.pos
+        while not self._eof() and self.src[self.pos] not in ",{}[] \t\r\n":
+            self.pos += 1
+        token = self.src[start : self.pos]
+        if token == "true":
+            return True
+        if token == "false":
+            return False
+        if token == "null":
+            return None
+        try:
+            if "." in token or "e" in token or "E" in token:
+                return float(token)
+            return int(token)
+        except ValueError:
+            return token
+
+
+def _parse_gemma4_args(s: str) -> dict[str, Any]:
+    try:
+        return _Gemma4Parser(s).parse_object_inner()
+    except (ValueError, IndexError):
+        return {}
 
 
 def _to_tool_call(obj: dict) -> Optional[dict]:
@@ -347,6 +472,18 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
         return text, []
 
     calls: list[dict] = []
+
+    matches = list(_TOOL_CALL_GEMMA4_RE.finditer(text))
+    if matches:
+        for m in matches:
+            fn_name = m.group(1).strip()
+            args_dict = _parse_gemma4_args(m.group(2))
+            call = _to_tool_call({"name": fn_name, "arguments": args_dict})
+            if call:
+                calls.append(call)
+        if calls:
+            cleaned = _TOOL_CALL_GEMMA4_RE.sub("", text).strip()
+            return cleaned, calls
 
     matches = list(_TOOL_CALL_QWEN_XML_RE.finditer(text))
     if matches:
@@ -430,6 +567,98 @@ def _parse_tool_calls(text: str) -> tuple[str, list[dict]]:
 
 def _has_tool_call_marker(text: str) -> bool:
     return any(marker in text for marker in _TOOL_CALL_START_MARKERS)
+
+
+# Gemma 4 thinking blocks: `<|channel>thought\n...\n<channel|>`. The model
+# emits zero or more of these before content or tool calls; chat_template
+# `strip_thinking` drops them when reading history. We surface their inner text
+# as OpenAI-style `reasoning_content` so clients can display the chain of
+# thought separately from the final answer.
+_THINKING_BLOCK_RE = re.compile(
+    r"<\|channel>thought\s*(.*?)\s*<channel\|>",
+    re.DOTALL,
+)
+
+
+def _extract_thinking(text: str) -> tuple[str, str]:
+    """Return `(text_without_thinking, joined_thinking)`."""
+    if not text or "<|channel>thought" not in text:
+        return text, ""
+    parts = _THINKING_BLOCK_RE.findall(text)
+    cleaned = _THINKING_BLOCK_RE.sub("", text).strip()
+    return cleaned, "\n".join(p.strip() for p in parts if p.strip())
+
+
+class _ThinkingStreamSplitter:
+    """Splits an incremental token stream into (content, reasoning) pairs.
+
+    Detects Gemma 4's `<|channel>thought ... <channel|>` blocks across token
+    boundaries, holds back partial markers, and routes the inner text into the
+    reasoning channel. Tool-call detection runs on the cumulative `full_text`
+    outside this splitter and is unaffected.
+    """
+
+    _OPEN = "<|channel>thought"
+    _CLOSE = "<channel|>"
+
+    def __init__(self) -> None:
+        self.in_thinking = False
+        self.buffer = ""
+
+    def feed(self, piece: str) -> tuple[str, str]:
+        self.buffer += piece
+        content_out: list[str] = []
+        reasoning_out: list[str] = []
+
+        while True:
+            if self.in_thinking:
+                idx = self.buffer.find(self._CLOSE)
+                if idx >= 0:
+                    if idx > 0:
+                        reasoning_out.append(self.buffer[:idx])
+                    self.buffer = self.buffer[idx + len(self._CLOSE) :]
+                    self.in_thinking = False
+                    continue
+                safe, hold = self._safe_split(self.buffer, self._CLOSE)
+                if safe:
+                    reasoning_out.append(safe)
+                self.buffer = hold
+                break
+
+            idx = self.buffer.find(self._OPEN)
+            if idx >= 0:
+                if idx > 0:
+                    content_out.append(self.buffer[:idx])
+                self.buffer = self.buffer[idx + len(self._OPEN) :]
+                if self.buffer.startswith("\n"):
+                    self.buffer = self.buffer[1:]
+                self.in_thinking = True
+                continue
+            safe, hold = self._safe_split(self.buffer, self._OPEN)
+            if safe:
+                content_out.append(safe)
+            self.buffer = hold
+            break
+
+        return "".join(content_out), "".join(reasoning_out)
+
+    def flush(self) -> tuple[str, str]:
+        """Drain remaining buffered text at end of stream."""
+        if not self.buffer:
+            return "", ""
+        out = self.buffer
+        self.buffer = ""
+        if self.in_thinking:
+            return "", out
+        return out, ""
+
+    @staticmethod
+    def _safe_split(buf: str, marker: str) -> tuple[str, str]:
+        n = min(len(buf), len(marker) - 1)
+        for i in range(n, 0, -1):
+            if marker.startswith(buf[-i:]):
+                return buf[:-i], buf[-i:]
+        return buf, ""
 
 
 async def _health(_request: Request) -> JSONResponse:
@@ -750,7 +979,14 @@ async def _handle_non_streaming(
                 "[TOOL_CALLS] markers — model did not follow tool-calling format"
             )
 
+    reasoning: str = ""
+    if content and "<|channel>thought" in content:
+        content_no_think, reasoning = _extract_thinking(content)
+        content = content_no_think or None
+
     message: dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -815,7 +1051,7 @@ async def _handle_streaming(
         }
         yield f"data: {json.dumps(initial_chunk)}\n\n"
 
-        def _content_chunk(content: str) -> str:
+        def _delta_chunk(delta: dict[str, Any]) -> str:
             chunk = {
                 "id": response_id,
                 "object": "chat.completion.chunk",
@@ -824,16 +1060,23 @@ async def _handle_streaming(
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": content},
+                        "delta": delta,
                         "finish_reason": None,
                     }
                 ],
             }
             return f"data: {json.dumps(chunk)}\n\n"
 
+        def _content_chunk(content: str) -> str:
+            return _delta_chunk({"content": content})
+
+        def _reasoning_chunk(reasoning: str) -> str:
+            return _delta_chunk({"reasoning_content": reasoning})
+
         full_text = ""
         unsent = ""
         tool_call_detected = False
+        thinking_splitter = _ThinkingStreamSplitter()
 
         gen = _do_generate(
             prompt_text, max_tokens, temperature, repetition_penalty, stop
@@ -843,14 +1086,22 @@ async def _handle_streaming(
                 piece = event["content"]
                 full_text += piece
 
+                content_piece, reasoning_piece = thinking_splitter.feed(piece)
+
+                if reasoning_piece:
+                    yield _reasoning_chunk(reasoning_piece)
+
+                if not content_piece:
+                    continue
+
                 if not tools_enabled:
-                    yield _content_chunk(piece)
+                    yield _content_chunk(content_piece)
                     continue
 
                 if tool_call_detected:
                     continue
 
-                unsent += piece
+                unsent += content_piece
                 if _has_tool_call_marker(full_text):
                     tool_call_detected = True
                     unsent = ""
@@ -861,6 +1112,10 @@ async def _handle_streaming(
                     yield _content_chunk(safe)
 
             elif event["type"] == "done":
+                content_tail, reasoning_tail = thinking_splitter.flush()
+                if reasoning_tail:
+                    yield _reasoning_chunk(reasoning_tail)
+
                 finish_reason = event.get("finish_reason", "stop")
                 tool_calls: list[dict] = []
 
@@ -890,23 +1145,12 @@ async def _handle_streaming(
                                 "arguments": call["function"]["arguments"],
                             },
                         }
-                        tc_chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"tool_calls": [delta_call]},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(tc_chunk)}\n\n"
+                        yield _delta_chunk({"tool_calls": [delta_call]})
                     finish_reason = "tool_calls"
-                elif tools_enabled and unsent:
-                    yield _content_chunk(unsent)
+                else:
+                    tail = (unsent + content_tail) if tools_enabled else content_tail
+                    if tail:
+                        yield _content_chunk(tail)
                     unsent = ""
 
                 final_chunk = {

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import logging
 import re
@@ -61,6 +62,17 @@ _api_key: str = ""
 _ctx_size: int = 4096
 _block_size: int = 0
 _cancel_event: asyncio.Event = asyncio.Event()
+
+# Pin all MLX inference work to one thread. mlx_lm.generate.generation_stream
+# is created via mx.new_thread_local_stream() at import time and only exists in
+# the thread that touches it. A multi-thread executor would dispatch successive
+# requests to different worker threads, raising:
+#   RuntimeError: There is no Stream(gpu, 1) in current thread
+# A single worker also matches the actual concurrency model: MLX runs one
+# generation on the GPU at a time anyway.
+_inference_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="mlx-infer"
+)
 
 
 def _generate_id(prefix: str = "chatcmpl") -> str:
@@ -578,7 +590,7 @@ def _do_generate(
             finally:
                 _put(_SENTINEL)
 
-        loop.run_in_executor(None, _sync_worker)
+        loop.run_in_executor(_inference_executor, _sync_worker)
 
         while True:
             event = await queue.get()

@@ -18,6 +18,7 @@ from typing import Any, AsyncGenerator, Optional
 
 import mlx.core as mx
 import uvicorn
+from mlx_lm.models import gemma4_text as _gemma4_text
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -26,6 +27,31 @@ from starlette.routing import Route
 
 logging.basicConfig(level=logging.INFO, format="[mlx] %(message)s")
 log = logging.getLogger("dflash.server")
+
+
+# Quantized Gemma 4 checkpoints (e.g. mlx-community/gemma-4-e4b-it-4bit) ship
+# k_proj/v_proj/k_norm weights for KV-shared layers, but mlx-lm >= 0.31.3
+# (PR #1158) no longer allocates those modules. Drop the orphan weights in
+# sanitize, mirroring upstream PR #1205. Remove this block once #1205 is merged
+# and pinned via mlx-lm version bump.
+#   https://github.com/ml-explore/mlx-lm/pull/1205
+_KV_SHARED_RE = re.compile(r"\.layers\.(\d+)\.self_attn\.(?:k_proj|v_proj|k_norm)\.")
+_orig_gemma4_sanitize = _gemma4_text.Model.sanitize
+
+
+def _patched_gemma4_sanitize(self, weights):
+    weights = _orig_gemma4_sanitize(self, weights)
+    first_kv_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
+    if self.args.num_kv_shared_layers <= 0:
+        return weights
+    return {
+        k: v
+        for k, v in weights.items()
+        if not ((m := _KV_SHARED_RE.search(k)) and int(m.group(1)) >= first_kv_shared)
+    }
+
+
+_gemma4_text.Model.sanitize = _patched_gemma4_sanitize
 
 _model = None
 _draft = None
